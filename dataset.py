@@ -1,43 +1,89 @@
-# dataset.py  (all of ChangeDetectionDataset, in‐memory version)
-
+# Dataset loading logic for Custom PNG Change Detection Dataset
 import os
+import glob
 import torch
-from torch.utils.data import Dataset
-from PIL import Image, UnidentifiedImageError
+from torch.utils.data import Dataset, ConcatDataset
+from PIL import Image, UnidentifiedImageError # Import specific error
 import numpy as np
 from torchvision import transforms
 import torchvision.transforms.functional as TF
+import random
 
-class NormalizeTransform:
-    """ Maps each image‐tensor from [0,1] → [-1,1]. """
+# --- Utility Function for Collation ---
+def collate_fn_skip_none(batch):
+    """Collate function that filters out None samples."""
+    batch = list(filter(lambda x: x is not None, batch))
+    if not batch: # If all samples in batch were None
+        return None
+    return torch.utils.data.dataloader.default_collate(batch)
+
+# --- Transforms ---
+class JointToTensor:
+    """Converts PIL images in sample dict to Tensors."""
     def __call__(self, sample):
-        sample["image1"] = (sample["image1"] - 0.5) / 0.5
-        sample["image2"] = (sample["image2"] - 0.5) / 0.5
+        img1 = sample["image1"]
+        img2 = sample["image2"]
+        label = sample["label"]
+
+        sample["image1"] = TF.to_tensor(img1)
+        sample["image2"] = TF.to_tensor(img2)
+        if label is not None:
+            # Convert label to binary (0 or 1) - threshold might need adjustment
+            label_np = np.array(label.convert("L"))
+            label_np = (label_np > 128).astype(np.uint8) # Assuming non-zero pixels are change
+            sample["label"] = torch.from_numpy(label_np).long() # Return as H x W tensor
+        else:
+            sample["label"] = None # Ensure label is None if not present
+
         return sample
 
-class ResizeTransform:
-    """
-    Resizes “image1”, “image2”, and “label” (if present) in a sample dict to a fixed (H, W).
-    - image1, image2 are (3×H×W) RGB tensors
-    - label is (H×W) integer mask {0,1}
-    """
+class JointRandomHorizontalFlip:
+    """Applies horizontal flip randomly to img1, img2, and label with probability p."""
+    def __init__(self, p=0.5):
+        self.p = p
+
+    def __call__(self, sample):
+        if random.random() < self.p:
+            sample["image1"] = TF.hflip(sample["image1"])
+            sample["image2"] = TF.hflip(sample["image2"])
+            if sample["label"] is not None:
+                sample["label"] = TF.hflip(sample["label"])
+        return sample
+
+class JointRandomVerticalFlip:
+    """Applies vertical flip randomly to img1, img2, and label with probability p."""
+    def __init__(self, p=0.5):
+        self.p = p
+
+    def __call__(self, sample):
+        if random.random() < self.p:
+            sample["image1"] = TF.vflip(sample["image1"])
+            sample["image2"] = TF.vflip(sample["image2"])
+            if sample["label"] is not None:
+                sample["label"] = TF.vflip(sample["label"])
+        return sample
+
+# Note: Random Rotation might be complex with labels, requires careful implementation
+# if needed later. Sticking to flips for now.
+
+class JointResize:
+    """Resizes img1, img2, and label in a sample dict to a target size."""
     def __init__(self, size):
-        self.size = size
+        self.size = size # (h, w)
 
     def __call__(self, sample):
         img1 = sample["image1"]
         img2 = sample["image2"]
         label = sample["label"]
 
-        # TF.resize can handle Tensor of shape (C, H, W) when using pytorch >= 1.13
+        # Resize images (expects C, H, W tensor)
         img1_resized = TF.resize(img1, self.size, interpolation=TF.InterpolationMode.BILINEAR)
         img2_resized = TF.resize(img2, self.size, interpolation=TF.InterpolationMode.BILINEAR)
 
+        # Resize label (expects H, W tensor)
         if label is not None:
-            # label is (H, W). Add channel=1 → (1, H, W), resize with NEAREST, then squeeze back → (H, W).
-            label_resized = TF.resize(label.unsqueeze(0),
-                                      self.size,
-                                      interpolation=TF.InterpolationMode.NEAREST)
+            # Add channel dim, resize with NEAREST, remove dim
+            label_resized = TF.resize(label.unsqueeze(0), self.size, interpolation=TF.InterpolationMode.NEAREST)
             label_resized = label_resized.squeeze(0)
         else:
             label_resized = None
@@ -47,177 +93,241 @@ class ResizeTransform:
         sample["label"] = label_resized
         return sample
 
+class JointNormalize:
+    """Normalizes image tensors (img1, img2) from [0, 1] to [-1, 1]."""
+    def __call__(self, sample):
+        sample["image1"] = (sample["image1"] * 2.0) - 1.0
+        sample["image2"] = (sample["image2"] * 2.0) - 1.0
+        return sample
 
-class ChangeDetectionDataset(Dataset):
-    """
-    Load the Onera Satellite Change Detection dataset entirely into memory as Tensors.
-
-    - In __init__, we:
-        • Collect all city‐folders for train/val/test.
-        • For each city, verify that img1.png, img2.png (and cm.png if applicable) can be fully decoded.
-        • Open, convert, load, tensor‐ify, resize, normalize, and store the resulting Tensors.
-        • Skip any city whose images or label cannot be fully decoded.
-
-    - In __getitem__, we simply return the preloaded tensors (no PIL calls at runtime).
-    """
-    VAL_CITIES   = ["pisa", "rennes", "saclay_e"]
-    TRAIN_CITIES = [
-        'abudhabi', 'aguasclaras', 'beihai', 'beirut',
-        'bercy', 'bordeaux', 'cupertino', 'hongkong',
-        'mumbai', 'nantes', 'paris'
-    ]
-
-    def __init__(self,
-                 root_dir,
-                 dataset_subdir="Onera Satellite Change Detection Dataset",
-                 mode="train",
-                 target_size=(128, 128)):
-        """
-        root_dir: path to the folder containing “Onera Satellite Change Detection Dataset”
-        mode: "train", "val", or "test"
-        target_size: (H, W) that we will resize each image & label to
-        """
-        super().__init__()
-        self.root_dir = root_dir
-        self.dataset_subdir = dataset_subdir
-        self.mode = mode
+# --- Base Dataset Class (Handles loading single source) ---
+class BaseChangeDetectionDataset(Dataset):
+    """Base class to load samples from a single source (real or synthetic)."""
+    def __init__(self, samples_list, target_size=(128, 128), augment=False):
+        self.samples = samples_list
         self.target_size = target_size
+        self.augment = augment
 
-        # ========== Compose transforms ==========
-        # 1) ToTensor() converts PIL‐Image to FloatTensor [0..1]
-        # 2) ResizeTransform → scale both images & label to target_size
-        # 3) NormalizeTransform → map [0..1] → [-1..1] for image1/image2
-        self.to_tensor = transforms.ToTensor()
-        self.resize_and_norm = transforms.Compose([
-            ResizeTransform(target_size),
-            NormalizeTransform()
-        ])
+        # Define transforms
+        transform_list = [
+            JointToTensor(),
+            JointResize(self.target_size)
+        ]
+        if self.augment:
+            transform_list.extend([
+                JointRandomHorizontalFlip(p=0.5),
+                JointRandomVerticalFlip(p=0.5),
+                # Add other augmentations like rotation here if desired
+            ])
+        transform_list.append(JointNormalize()) # Normalize last
 
-        # ========== Build “base” paths for images & labels ==========
-        dataset_base = os.path.join(root_dir, dataset_subdir)
+        self.transform = transforms.Compose(transform_list)
 
-        image_base = os.path.join(
-            dataset_base,
-            "images",
-            "Onera Satellite Change Detection dataset - Images"
-        )
-        label_base = os.path.join(
-            dataset_base,
-            "train_labels",
-            "Onera Satellite Change Detection dataset - Train Labels"
-        )
+    def _load_pil_image(self, file_path):
+        try:
+            img = Image.open(file_path).convert("RGB")
+            img.load() # Force loading data
+            return img
+        except Exception as e:
+            print(f"Error loading PIL image {file_path}: {e}")
+            raise
 
-        if not os.path.isdir(image_base):
-            print(f"Warning: Image base directory not found at:\n    {image_base}")
-        if mode != "test" and not os.path.isdir(label_base):
-            print(f"Warning: Label base directory not found at:\n    {label_base}")
-
-        # ========== Decide which cities to iterate over ==========
-        if mode == "train":
-            cities = self.TRAIN_CITIES
-            self.has_labels = True
-        elif mode == "val":
-            cities = self.VAL_CITIES
-            self.has_labels = True
-        elif mode == "test":
-            # Simply list whatever subfolders exist in image_base
-            try:
-                cities = [
-                    d for d in os.listdir(image_base)
-                    if os.path.isdir(os.path.join(image_base, d))
-                ]
-                print(f"Using {len(cities)} cities for TEST: {cities}")
-            except FileNotFoundError:
-                print(f"Error: Cannot list cities in {image_base}.")
-                cities = []
-            self.has_labels = False
-        else:
-            raise ValueError(f"Invalid mode='{mode}'. Must be 'train', 'val', or 'test'.")
-
-        # ========== Preload everything into memory ==========
-        self.samples = []
-        print(f"Processing cities for mode '{mode}': {cities}")
-
-        for city in cities:
-            img1_path = os.path.join(image_base, city, "pair", "img1.png")
-            img2_path = os.path.join(image_base, city, "pair", "img2.png")
-            label_path = None
-            if self.has_labels:
-                label_path = os.path.join(label_base, city, "cm", "cm.png")
-
-            # If any expected file is missing → skip city
-            if not os.path.exists(img1_path) or not os.path.exists(img2_path):
-                print(f"  • Warning: Missing img1.png or img2.png for city='{city}'. Skipping.")
-                continue
-            if self.has_labels and not os.path.exists(label_path):
-                print(f"  • Warning: Missing cm.png for city='{city}'. Skipping.")
-                continue
-
-            # --- FULL DECODE & PRELOAD STEP ---
-            try:
-                # 1) Load img1
-                with Image.open(img1_path) as imA:
-                    imA_rgb = imA.convert("RGB")
-                    imA_rgb.load()  # force PIL to read every pixel
-                img1_tensor = self.to_tensor(imA_rgb)
-
-                # 2) Load img2
-                with Image.open(img2_path) as imB:
-                    imB_rgb = imB.convert("RGB")
-                    imB_rgb.load()
-                img2_tensor = self.to_tensor(imB_rgb)
-
-                # 3) If labels exist, load and binarize
-                if self.has_labels:
-                    with Image.open(label_path) as lab:
-                        lab_gray = lab.convert("L")
-                        lab_gray.load()
-                    lab_arr = np.array(lab_gray)
-                    lab_mask = (lab_arr > 128).astype(np.uint8)
-                    label_tensor = torch.from_numpy(lab_mask).long()  # shape (H, W)
-                else:
-                    label_tensor = None
-
-                # 4) Apply resizing & normalization now (in‐memory!)
-                sample_dict = {
-                    "image1": img1_tensor,   # shape (3, H, W)
-                    "image2": img2_tensor,   # shape (3, H, W)
-                    "label":  label_tensor,  # shape (H, W) or None
-                    "city":   city
-                }
-                sample_dict = self.resize_and_norm(sample_dict)
-            except (UnidentifiedImageError, OSError) as e:
-                print(f"  • Warning: Failed to fully decode city='{city}'. Skipping. ▶ {e}")
-                continue
-
-            # If we reach here, everything is good: store the pre‐loaded, pre‐processed tensors.
-            self.samples.append(sample_dict)
-
-        print(f"Found {len(self.samples)} valid samples for mode='{mode}'.\n")
-
+    def _load_pil_label(self, label_file):
+        if label_file is None:
+            return None
+        try:
+            label_img = Image.open(label_file).convert("L")
+            label_img.load()
+            return label_img
+        except Exception as e:
+            print(f"Error loading PIL label {label_file}: {e}")
+            raise
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        """
-        Simply return the preloaded + preprocessed tensors. No PIL calls here!
-        """
         if torch.is_tensor(idx):
             idx = idx.tolist()
-        sample = self.samples[idx]
 
-        # We can (optionally) print to track which city is loaded at batch time:
-        print(f"  [DATASET] Returning sample idx={idx} (city='{sample['city']}')")
+        if idx >= len(self.samples):
+             print(f"Error: Index {idx} out of bounds for dataset size {len(self.samples)}.")
+             return None
 
-        # Return a dict with:
-        #    "image1" → Tensor (3, H, W)
-        #    "image2" → Tensor (3, H, W)
-        #    "label"  → Tensor (H, W)  or None
-        #    "city"   → string
-        return {
-            "image1": sample["image1"],
-            "image2": sample["image2"],
-            "label":  sample["label"],
-            "city":   sample["city"]
-        }
+        sample_info = self.samples[idx]
+
+        try:
+            img1_pil = self._load_pil_image(sample_info["img1"])
+            img2_pil = self._load_pil_image(sample_info["img2"])
+            label_pil = self._load_pil_label(sample_info["label"])
+
+            sample = {"image1": img1_pil, "image2": img2_pil, "label": label_pil, "city": sample_info["city"]}
+
+            if self.transform:
+                sample = self.transform(sample)
+
+            # Ensure label is None if it started as None
+            if sample_info["label"] is None:
+                sample["label"] = None
+
+            return sample
+
+        except Exception as e:
+            print(f"Failed to load/transform sample for city {sample_info.get("city", "N/A")} at index {idx}: {e}. Returning None.")
+            return None
+
+# --- Helper Function to Scan for Samples ---
+def scan_dataset(data_dir, label_dir=None, is_synthetic=False):
+    """Scans a directory structure (real or synthetic) for valid samples."""
+    samples = []
+    skipped_samples = 0
+    image_folders = glob.glob(os.path.join(data_dir, "*")) # List cities/folders
+
+    for city_folder in image_folders:
+        if not os.path.isdir(city_folder):
+            continue
+        city_name = os.path.basename(city_folder)
+
+        if is_synthetic:
+            # Synthetic structure: images/<city>/img1_synth_*.png, labels/<city>/cm_synth_*.png
+            img1_files = sorted(glob.glob(os.path.join(city_folder, "img1_synth_*.png")))
+            for img1_file in img1_files:
+                base_name = os.path.basename(img1_file).replace("img1_", "")
+                img2_file = os.path.join(city_folder, f"img2_{base_name}")
+                label_file = os.path.join(label_dir, city_name, f"cm_{base_name}") if label_dir else None
+
+                if not os.path.exists(img2_file):
+                    print(f"Warning: Missing synthetic img2 for {img1_file}. Skipping.")
+                    skipped_samples += 1
+                    continue
+                if label_dir and not os.path.exists(label_file):
+                    print(f"Warning: Missing synthetic label for {img1_file}. Skipping.")
+                    skipped_samples += 1
+                    continue
+
+                if _check_image_readable(img1_file) and _check_image_readable(img2_file) and (label_file is None or _check_image_readable(label_file)):
+                    samples.append({"img1": img1_file, "img2": img2_file, "label": label_file, "city": f"{city_name}_synth"})
+                else:
+                    print(f"Warning: Unreadable synthetic file found for city {city_name}, base {base_name}. Skipping.")
+                    skipped_samples += 1
+        else:
+            # Real structure: images/.../<city>/pair/img1.png, labels/.../<city>/cm/cm.png
+            img1_file = os.path.join(city_folder, "pair", "img1.png")
+            img2_file = os.path.join(city_folder, "pair", "img2.png")
+            label_file = os.path.join(label_dir, city_name, "cm", "cm.png") if label_dir else None
+
+            if not os.path.exists(img1_file) or not os.path.exists(img2_file):
+                # print(f"Warning: Missing real img1/img2 for city {city_name}. Skipping.")
+                skipped_samples += 1
+                continue
+            if label_dir and not os.path.exists(label_file):
+                # print(f"Warning: Missing real label for city {city_name}. Skipping.")
+                skipped_samples += 1
+                continue
+
+            if _check_image_readable(img1_file) and _check_image_readable(img2_file) and (label_file is None or _check_image_readable(label_file)):
+                samples.append({"img1": img1_file, "img2": img2_file, "label": label_file, "city": city_name})
+            else:
+                print(f"Warning: Unreadable real file found for city {city_name}. Skipping.")
+                skipped_samples += 1
+
+    print(f"Scanned {data_dir}. Found {len(samples)} valid samples. Skipped {skipped_samples}.")
+    return samples
+
+def _check_image_readable(file_path):
+    """Checks if an image file can be opened and loaded by PIL."""
+    if file_path is None:
+        return True # Allow None labels
+    try:
+        with Image.open(file_path) as img:
+            img.verify() # Verify closes the file
+        with Image.open(file_path) as img:
+            img.load() # Load image data
+        return True
+    except (FileNotFoundError, UnidentifiedImageError, SyntaxError, OSError, ValueError) as e:
+        # print(f"Readability Check Error for {file_path}: {e}") # Reduce verbosity
+        return False
+
+# --- Function to Create Combined Dataset ---
+def create_change_detection_dataset(root_dir, dataset_subdir="Onera Satellite Change Detection Dataset", synthetic_data_dir="synthetic_data", mode="train", target_size=(128, 128), use_synthetic=False):
+    """
+    Factory function to create the appropriate dataset (real, synthetic, or combined).
+    Args:
+        use_synthetic (bool): If True and mode is 'train', combine real and synthetic data.
+    """
+    # Define city splits
+    ALL_CITIES = ["abudhabi", "aguasclaras", "beihai", "beirut", "bercy", "bordeaux", "cupertino", "hongkong", "mumbai", "nantes", "paris", "pisa", "rennes", "saclay_e"]
+    VAL_CITIES = ["pisa", "rennes", "saclay_e"]
+    TRAIN_CITIES = [city for city in ALL_CITIES if city not in VAL_CITIES]
+
+    # Define base paths for real data
+    dataset_base_path = os.path.join(root_dir, dataset_subdir)
+    real_image_base = os.path.join(dataset_base_path, "images", "Onera Satellite Change Detection dataset - Images")
+    real_label_base = os.path.join(dataset_base_path, "train_labels", "Onera Satellite Change Detection dataset - Train Labels")
+
+    # Define base paths for synthetic data
+    synth_base_path = os.path.join(root_dir, synthetic_data_dir)
+    synth_image_base = os.path.join(synth_base_path, "images")
+    synth_label_base = os.path.join(synth_base_path, "labels")
+
+    # Determine cities and augment status based on mode
+    if mode == "train":
+        target_cities = TRAIN_CITIES
+        has_labels = True
+        augment = True # Apply standard augmentation only for training
+    elif mode == "val":
+        target_cities = VAL_CITIES
+        has_labels = True
+        augment = False
+    elif mode == "test":
+        try:
+            target_cities = [d for d in os.listdir(real_image_base) if os.path.isdir(os.path.join(real_image_base, d))]
+        except FileNotFoundError:
+            target_cities = []
+        has_labels = False
+        augment = False
+    else:
+        raise ValueError(f"Invalid mode: {mode}")
+
+    # Scan for real samples
+    print(f"--- Scanning Real Data ({mode}) ---")
+    real_samples = scan_dataset(
+        real_image_base,
+        real_label_base if has_labels else None,
+        is_synthetic=False
+    )
+    # Filter real samples by target cities for train/val
+    if mode in ["train", "val"]:
+        real_samples = [s for s in real_samples if s["city"] in target_cities]
+        print(f"Filtered real samples for {mode} cities: {len(real_samples)} samples.")
+
+    real_dataset = BaseChangeDetectionDataset(real_samples, target_size=target_size, augment=augment)
+
+    # If training and use_synthetic is True, scan and add synthetic data
+    if mode == "train" and use_synthetic:
+        print(f"--- Scanning Synthetic Data ({mode}) ---")
+        if not os.path.isdir(synth_image_base):
+            print(f"Warning: Synthetic image directory not found at {synth_image_base}. Cannot use synthetic data.")
+            return real_dataset # Return only real data
+
+        synthetic_samples = scan_dataset(
+            synth_image_base,
+            synth_label_base if has_labels else None,
+            is_synthetic=True
+        )
+        # Filter synthetic samples to only include those derived from training cities
+        synthetic_samples = [s for s in synthetic_samples if s["city"].replace("_synth", "") in target_cities]
+        print(f"Filtered synthetic samples for {mode} cities: {len(synthetic_samples)} samples.")
+
+        if synthetic_samples:
+            synthetic_dataset = BaseChangeDetectionDataset(synthetic_samples, target_size=target_size, augment=augment)
+            print(f"Combining {len(real_dataset)} real samples and {len(synthetic_dataset)} synthetic samples for training.")
+            return ConcatDataset([real_dataset, synthetic_dataset])
+        else:
+            print("No valid synthetic samples found. Using only real data for training.")
+            return real_dataset
+    else:
+        # For val/test or if not using synthetic, return only the real dataset
+        return real_dataset
+
+

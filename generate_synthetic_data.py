@@ -7,12 +7,16 @@ from PIL import Image
 import torchvision.transforms.functional as TF
 
 # Assuming models.py and dataset.py are accessible
-from dataset import ChangeDetectionDataset, collate_fn_skip_none # Import dataset and collate function
+from dataset import BaseChangeDetectionDataset, collate_fn_skip_none, scan_dataset # Import dataset, collate function, and scan_dataset
 from models import UNetGenerator # Import the Generator model
 
 # --- Configuration ---
 ROOT_DIR = "/Users/mac/Desktop/MAYNA/Code/Change_Detection_Package" # User specified root
-DATASET_SUBDIR = "Onera Satellite Change Detection Dataset"
+DATASET_SUBDIR = "Onera Satellite Change Detection Dataset" 
+# Define specific subdirectories for images and labels based on the original dataset structure
+IMAGES_DATA_DIR = os.path.join(ROOT_DIR, DATASET_SUBDIR, "images", "Onera Satellite Change Detection dataset - Images") # Path to the 'images' directory containing city folders
+LABELS_DATA_DIR = os.path.join(ROOT_DIR, DATASET_SUBDIR, "train_labels", "Onera Satellite Change Detection dataset - Train Labels") # Path to the 'labels' directory containing city folders
+
 GAN_CHECKPOINT_DIR = os.path.join(ROOT_DIR, "gan_checkpoints")
 GENERATOR_CHECKPOINT_NAME = "generator_epoch_100.pth" # Assumes 100 epochs were trained, adjust if needed
 SYNTHETIC_DATA_DIR = os.path.join(ROOT_DIR, "synthetic_data") # Output directory for generated data
@@ -32,8 +36,32 @@ print(f"Using device: {DEVICE}")
 def generate_data():
     # Load Dataset (using the training split to generate synthetic pairs)
     print("Loading original dataset (train split) for generation...")
+    # Scan the dataset to get the list of samples for the 'train' mode
+    # Assuming 'train' mode means using the main image and label directories
+    # The scan_dataset function expects the direct parent folder of city folders.
+    # For Onera, 'images' and 'labels' folders contain city subfolders.
+    # We'll construct paths to the 'train' subdirectories if they exist, or use the main ones.
+    # For simplicity, this example assumes 'train' data is directly under IMAGES_DATA_DIR/LABELS_DATA_DIR.
+    # A more robust solution would handle 'train'/'test'/'val' subfolders if they exist.
+    
+    # Construct paths for the 'train' data. This might need adjustment based on actual structure.
+    # If Onera has train/test splits within 'images' and 'labels' (e.g., images/train, labels/train), adjust here.
+    # For now, assuming 'train' uses the top-level city folders in IMAGES_DATA_DIR and LABELS_DATA_DIR.
+    train_images_dir = os.path.join(IMAGES_DATA_DIR, "train") # Or just IMAGES_DATA_DIR if no 'train' subfolder
+    train_labels_dir = os.path.join(LABELS_DATA_DIR, "train") # Or just LABELS_DATA_DIR
+
+    # Check if 'train' subdirectories exist, otherwise use the main directories
+    if not os.path.isdir(train_images_dir):
+        print(f"'train' subdirectory not found in {IMAGES_DATA_DIR}, using the main directory.")
+        train_images_dir = IMAGES_DATA_DIR
+    if not os.path.isdir(train_labels_dir):
+        print(f"'train' subdirectory not found in {LABELS_DATA_DIR}, using the main directory.")
+        train_labels_dir = LABELS_DATA_DIR
+
+    samples_list = scan_dataset(data_dir=train_images_dir, label_dir=train_labels_dir, is_synthetic=False)
+
     # Note: Dataset loads images normalized to [-1, 1] because of NormalizeTransform
-    original_dataset = ChangeDetectionDataset(root_dir=ROOT_DIR, dataset_subdir=DATASET_SUBDIR, mode="train", target_size=TARGET_SIZE)
+    original_dataset = BaseChangeDetectionDataset(samples_list=samples_list, target_size=TARGET_SIZE, augment=False) # Pass samples_list and augment=False for generation
 
     if len(original_dataset) == 0:
         print("Error: Original training dataset is empty. Cannot generate synthetic data.")

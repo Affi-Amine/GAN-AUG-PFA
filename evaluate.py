@@ -8,12 +8,15 @@ import os
 import matplotlib.pyplot as plt
 
 # Assuming models.py and dataset.py are accessible
-from dataset import ChangeDetectionDataset
+from dataset import BaseChangeDetectionDataset, scan_dataset # Import scan_dataset
 from models import SiameseUNet
 
 # --- Configuration ---
 ROOT_DIR = "/Users/mac/Desktop/MAYNA/Code/Change_Detection_Package"  # User specified root
-DATASET_SUBDIR = "Onera Satellite Change Detection Dataset" # User specified dataset subdir
+# Define specific paths for images and labels, accounting for nested structure
+IMAGES_DATA_DIR = os.path.join(ROOT_DIR, "Onera Satellite Change Detection Dataset", "images", "Onera Satellite Change Detection dataset - Images")
+LABELS_DATA_DIR = os.path.join(ROOT_DIR, "Onera Satellite Change Detection Dataset", "train_labels", "Onera Satellite Change Detection dataset - Train Labels")
+
 CHECKPOINT_PATH = os.path.join(ROOT_DIR, "siamese_checkpoints", "best_model.pth") # Default to best model
 OUTPUT_DIR = os.path.join(ROOT_DIR, "evaluation_results")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -162,8 +165,29 @@ def evaluate_model(model, loader, output_dir):
 def main():
     # Dataset and Dataloader for Validation set
     print("Loading validation dataset...")
-    # Use the updated ChangeDetectionDataset, remove bands argument
-    val_dataset = ChangeDetectionDataset(root_dir=ROOT_DIR, dataset_subdir=DATASET_SUBDIR, mode="val", target_size=TARGET_SIZE)
+
+    # Scan for validation samples
+    print("--- Scanning Real Data (val) ---")
+    # Adjust city_list for validation as needed, or remove if all cities are used for validation
+    # For now, assuming all found samples in the specified directories are for validation
+    samples_list_val = scan_dataset(
+        data_dir=IMAGES_DATA_DIR,  # Corrected: images_dir -> data_dir
+        label_dir=LABELS_DATA_DIR, # Corrected: labels_dir -> label_dir
+        is_synthetic=False # Assuming evaluation is on real data
+        # dataset_type and mode are not params of scan_dataset, filtering might be needed post-scan
+    )
+
+    if not samples_list_val:
+        print("Error: No validation samples found. Check dataset paths and structure.")
+        return
+
+    # Use the updated ChangeDetectionDataset
+    val_dataset = BaseChangeDetectionDataset(
+        samples_list=samples_list_val,
+        target_size=TARGET_SIZE,
+        augment=False # No augmentation for validation
+    )
+
     if len(val_dataset) == 0:
         print("Error: Validation dataset is empty. Check dataset path, structure, and mode.")
         return
