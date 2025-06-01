@@ -1,0 +1,10 @@
+torch
+torchvision
+torchaudio
+rasterio
+tqdm
+Pillow
+numpy
+matplotlib # Added for evaluation script visualizations
+kaggle # Optional: Needed only if using Kaggle CLI to download dataset
+

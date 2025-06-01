@@ -1,0 +1,38 @@
+# Python environments
+venv/
+.env/
+.venv/
+env/
+virtualenv/
+
+# Byte-compiled files
+__pycache__/
+*.py[cod]
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Folders
+evaluation_results/
+gan_checkpoints/
+gan_samples/
+siamese_checkpoints/
+Onera Satellite Change Detection Dataset/
+
+# Logs and databases
+*.log
+*.sql
+*.sqlite
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
