@@ -118,7 +118,9 @@ def evaluate_model(model, loader, output_dir):
     progress_bar = tqdm(loader, desc="Evaluating", leave=False)
 
     with torch.no_grad():
+        print(f"Starting evaluation loop with {len(loader)} batches.") # Added log
         for i, batch in enumerate(progress_bar):
+            print(f"Processing batch {i+1}/{len(loader)}") # Added log
             img1 = batch["image1"].to(DEVICE)
             img2 = batch["image2"].to(DEVICE)
             labels = batch["label"].to(DEVICE)
@@ -139,14 +141,17 @@ def evaluate_model(model, loader, output_dir):
             num_samples += len(cities)
 
             # Visualize some samples
+            print(f"  Batch {i+1}: Visualizing up to {NUM_VISUALIZATIONS} samples if conditions met.") # Added log
             for j in range(len(cities)):
                 if visualized_count < NUM_VISUALIZATIONS:
+                    print(f"    Visualizing sample {visualized_count + 1} (City: {cities[j]}, Index in batch: {j})") # Added log
                     visualize_sample(img1[j], img2[j], labels[j], preds[j], cities[j], visualized_count, output_dir)
                     visualized_count += 1
 
     # Calculate average metrics
     avg_metrics = {key: val / num_samples for key, val in total_metrics.items()}
 
+    print(f"Finished evaluation loop. Processed {num_samples} samples across {len(loader)} batches.") # Added log
     print("\n--- Evaluation Metrics ---")
     for key, val in avg_metrics.items():
         print(f"{key.capitalize()}: {val:.4f}")
@@ -168,6 +173,7 @@ def main():
 
     # Scan for validation samples
     print("--- Scanning Real Data (val) ---")
+    print(f"Starting scan_dataset with data_dir: {IMAGES_DATA_DIR} and label_dir: {LABELS_DATA_DIR}") # Added log
     # Adjust city_list for validation as needed, or remove if all cities are used for validation
     # For now, assuming all found samples in the specified directories are for validation
     samples_list_val = scan_dataset(
@@ -176,6 +182,7 @@ def main():
         is_synthetic=False # Assuming evaluation is on real data
         # dataset_type and mode are not params of scan_dataset, filtering might be needed post-scan
     )
+    print(f"scan_dataset finished. Found {len(samples_list_val) if samples_list_val else 0} validation samples.") # Added log
 
     if not samples_list_val:
         print("Error: No validation samples found. Check dataset paths and structure.")

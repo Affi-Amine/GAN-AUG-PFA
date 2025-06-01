@@ -21,6 +21,7 @@ gan_checkpoints/
 gan_samples/
 siamese_checkpoints/
 Onera Satellite Change Detection Dataset/
+synthetic_data/
 
 # Logs and databases
 *.log
