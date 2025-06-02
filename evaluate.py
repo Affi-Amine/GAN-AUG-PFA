@@ -65,6 +65,9 @@ def calculate_metrics(preds, targets, smooth=1e-6):
 
 # --- Visualization Function ---
 def visualize_sample(img1, img2, label, pred, city_name, index, output_dir):
+    # Ensure label is a tensor, if it's a PIL Image, convert it (already handled in evaluate_single_pair by passing tensor)
+    # if isinstance(label, Image.Image):
+    #     label = T.ToTensor()(label)
     # Convert tensors to numpy arrays for plotting
     # Select RGB bands if using all bands
     if img1.shape[0] == 13:
@@ -74,7 +77,23 @@ def visualize_sample(img1, img2, label, pred, city_name, index, output_dir):
         img1_rgb = img1.cpu().numpy().transpose(1, 2, 0)
         img2_rgb = img2.cpu().numpy().transpose(1, 2, 0)
 
-    label_np = label.cpu().numpy()
+    # Handle cases where label might be None or not a tensor with data
+    if label is not None and hasattr(label, 'cpu') and label.numel() > 0: # Check if tensor has elements
+        label_np = label.cpu().numpy()
+        if label_np.ndim == 3 and label_np.shape[0] == 1: # Ensure it's [H, W] for imshow
+            label_np = label_np.squeeze(0)
+        elif label_np.ndim == 2: # Already [H,W]
+            pass # It's fine
+        else:
+            # Fallback for unexpected label shape
+            h, w = pred.shape[-2:] if pred is not None and pred.ndim >=2 else TARGET_SIZE
+            label_np = np.zeros((h, w), dtype=np.uint8)
+            print(f"Warning: Unexpected label shape {label.shape}, displaying empty ground truth.")
+    else:
+        # Create a dummy black image if no label for visualization consistency
+        h, w = pred.shape[-2:] if pred is not None and pred.ndim >=2 else TARGET_SIZE
+        label_np = np.zeros((h, w), dtype=np.uint8)
+
     pred_np = (pred.squeeze(0).cpu().numpy() > 0.5).astype(np.uint8) # Apply threshold
 
     # Clip values for display if normalization was basic
@@ -190,9 +209,102 @@ def evaluate_model(model, loader, output_dir):
 
     return avg_overall_metrics
 
+from PIL import Image
+import torchvision.transforms as T
+
+# --- Function to evaluate a single pair of images ---
+def evaluate_single_pair(model, img1_path, img2_path, city_name, label_path=None, target_size=(128, 128), device="cpu", output_dir="evaluation_results"):
+    model.eval()
+    os.makedirs(output_dir, exist_ok=True)
+
+    transform = T.Compose([
+        T.Resize(target_size, interpolation=T.InterpolationMode.BICUBIC),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) # Assuming ImageNet normalization for RGB
+    ])
+
+    try:
+        img1 = Image.open(img1_path).convert("RGB")
+        img2 = Image.open(img2_path).convert("RGB")
+    except FileNotFoundError:
+        print(f"Error: One or both image paths not found: {img1_path}, {img2_path}")
+        return
+
+    img1_tensor = transform(img1).unsqueeze(0).to(device)
+    img2_tensor = transform(img2).unsqueeze(0).to(device)
+
+    label_tensor_resized = None
+    label_for_viz = None # This will be a PIL Image or None
+
+    if label_path:
+        try:
+            label_pil = Image.open(label_path).convert("L") # Grayscale PIL Image
+            
+            # For visualization, resize PIL image
+            label_for_viz = T.Resize(target_size, interpolation=T.InterpolationMode.NEAREST)(label_pil)
+            
+            # For metrics, transform to tensor and resize
+            label_transform_metric = T.Compose([
+                T.Resize(target_size, interpolation=T.InterpolationMode.NEAREST),
+                T.ToTensor() # This will be [C, H, W]
+            ])
+            label_tensor_resized = label_transform_metric(label_pil).unsqueeze(0).to(device) # [B, C, H, W]
+
+        except FileNotFoundError:
+            print(f"Warning: Label path not found: {label_path}. Proceeding without metrics.")
+            label_path = None # Ensure it's None if file not found
+
+    with torch.no_grad():
+        output = model(img1_tensor, img2_tensor)
+        pred = torch.sigmoid(output) # Apply sigmoid
+
+    # Prepare label for visualization (even if None)
+    # visualize_sample expects a tensor for label
+    if label_for_viz is not None:
+        label_viz_tensor = T.ToTensor()(label_for_viz) # Convert PIL to Tensor
+    else:
+        # Create a dummy black tensor if no label for visualization consistency
+        h, w = pred.shape[-2:] if pred is not None and pred.ndim >=2 else target_size
+        label_viz_tensor = torch.zeros((1, h, w), dtype=torch.float32) # [C, H, W]
+
+    print(f"Visualizing single pair for city: {city_name}")
+    visualize_sample(img1_tensor.squeeze(0), img2_tensor.squeeze(0), 
+                     label_viz_tensor, # Pass the resized tensor or dummy
+                     pred.squeeze(0), 
+                     city_name, "single_eval", output_dir)
+
+    if label_tensor_resized is not None and label_path:
+        metrics = calculate_metrics(pred.cpu(), label_tensor_resized.cpu())
+        print(f"\n--- Metrics for {city_name} ({os.path.basename(img1_path)}, {os.path.basename(img2_path)}) ---")
+        for key, val in metrics.items():
+            print(f"{key.capitalize()}: {val:.4f}")
+    elif not label_path:
+        print("No label path provided, skipping metrics calculation.")
+    # Implicitly, if label_path was provided but file not found, it's handled by the earlier print and label_path being set to None
+
+
 # --- Main Evaluation ---
-def main():
-    # Dataset and Dataloader for Validation set
+def main(args):
+    # Check if running in single pair evaluation mode
+    if args.image1_path and args.image2_path and args.city_name:
+        print(f"Evaluating single image pair for city: {args.city_name}")
+        model = SiameseUNet(n_channels=N_CHANNELS, n_classes=N_CLASSES).to(DEVICE)
+        if os.path.exists(CHECKPOINT_PATH):
+            try:
+                model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
+                print(f"Model loaded from {CHECKPOINT_PATH}")
+            except Exception as e:
+                print(f"Error loading model state_dict: {e}")
+                return
+        else:
+            print(f"Error: Checkpoint not found at {CHECKPOINT_PATH}. Cannot evaluate single pair.")
+            return
+        evaluate_single_pair(model, args.image1_path, args.image2_path, args.city_name, 
+                             label_path=args.label_path, target_size=TARGET_SIZE, 
+                             device=DEVICE, output_dir=OUTPUT_DIR)
+        return # Exit after single pair evaluation
+
+    # Original main logic for full dataset evaluation
     print("Loading validation dataset...")
 
     # Scan for validation samples
@@ -242,15 +354,33 @@ def main():
     evaluate_model(model, val_loader, OUTPUT_DIR)
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Evaluate Change Detection Model")
+    parser.add_argument("--image1-path", type=str, help="Path to the first image (before change)")
+    parser.add_argument("--image2-path", type=str, help="Path to the second image (after change)")
+    parser.add_argument("--label-path", type=str, default=None, help="Optional path to the ground truth change mask")
+    parser.add_argument("--city-name", type=str, help="Name of the city/area for identification in output")
+    # Add existing args if any, or ensure they don't conflict
+    # For example, if CHECKPOINT_PATH was an arg:
+    # parser.add_argument("--checkpoint-path", type=str, default=CHECKPOINT_PATH, help="Path to model checkpoint")
+
     # Need to install matplotlib if not present
     try:
         import matplotlib
+        matplotlib.use("Agg") # Use non-interactive backend suitable for scripts
+        import matplotlib.pyplot as plt
     except ImportError:
-        print("Matplotlib not found. Installing...")
-        os.system("pip3 install matplotlib")
-        import matplotlib
-    matplotlib.use("Agg") # Use non-interactive backend suitable for scripts
-    import matplotlib.pyplot as plt
-    main()
+        print("Matplotlib not found. Please install it manually: pip install matplotlib")
+        # os.system("pip3 install matplotlib") # Avoid auto-installing in general purpose tool
+        # import matplotlib # Try importing again
+        # matplotlib.use("Agg") 
+        # import matplotlib.pyplot as plt
+        # For now, if matplotlib is not there, visualization will fail later but core logic might run.
+        # Or, exit if matplotlib is critical.
+        print("Matplotlib is required for visualization. Please install it and try again.")
+        exit(1)
+        
+    args = parser.parse_args()
+    main(args)
 
 
