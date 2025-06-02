@@ -112,6 +112,8 @@ def evaluate_model(model, loader, output_dir):
     all_preds = []
     all_labels = []
     total_metrics = {"accuracy": 0, "precision": 0, "recall": 0, "f1": 0, "iou": 0}
+    per_city_metrics = {}
+    per_city_counts = {}
     num_samples = 0
     visualized_count = 0
 
@@ -134,10 +136,21 @@ def evaluate_model(model, loader, output_dir):
             all_preds.append(preds.cpu())
             all_labels.append(labels.cpu())
 
-            # Calculate metrics per batch
-            batch_metrics = calculate_metrics(preds.cpu(), labels.cpu())
-            for key in total_metrics:
-                total_metrics[key] += batch_metrics[key] * len(cities)
+            # Calculate and accumulate metrics
+            for k in range(len(cities)):
+                city = cities[k]
+                pred_sample = preds[k:k+1].cpu()
+                label_sample = labels[k:k+1].cpu()
+                sample_metrics = calculate_metrics(pred_sample, label_sample)
+
+                if city not in per_city_metrics:
+                    per_city_metrics[city] = {key: 0.0 for key in sample_metrics}
+                    per_city_counts[city] = 0
+                
+                for key in sample_metrics:
+                    per_city_metrics[city][key] += sample_metrics[key]
+                    total_metrics[key] += sample_metrics[key] # Accumulate for overall average
+                per_city_counts[city] += 1
             num_samples += len(cities)
 
             # Visualize some samples
@@ -148,13 +161,24 @@ def evaluate_model(model, loader, output_dir):
                     visualize_sample(img1[j], img2[j], labels[j], preds[j], cities[j], visualized_count, output_dir)
                     visualized_count += 1
 
-    # Calculate average metrics
-    avg_metrics = {key: val / num_samples for key, val in total_metrics.items()}
+    # Calculate average overall metrics
+    avg_overall_metrics = {key: val / num_samples for key, val in total_metrics.items() if num_samples > 0}
 
-    print(f"Finished evaluation loop. Processed {num_samples} samples across {len(loader)} batches.") # Added log
-    print("\n--- Evaluation Metrics ---")
-    for key, val in avg_metrics.items():
+    print(f"Finished evaluation loop. Processed {num_samples} samples across {len(loader)} batches.")
+    print("\n--- Overall Evaluation Metrics ---")
+    for key, val in avg_overall_metrics.items():
         print(f"{key.capitalize()}: {val:.4f}")
+
+    print("\n--- Per-City Evaluation Metrics ---")
+    for city, metrics in per_city_metrics.items():
+        count = per_city_counts[city]
+        if count > 0:
+            avg_city_metrics = {key: val / count for key, val in metrics.items()}
+            print(f"City: {city} (Samples: {count})")
+            for key, val in avg_city_metrics.items():
+                print(f"  {key.capitalize()}: {val:.4f}")
+        else:
+            print(f"City: {city} (Samples: 0) - No metrics calculated")
 
     # Optionally calculate metrics over the entire dataset (if memory allows)
     # all_preds_tensor = torch.cat(all_preds, dim=0)
@@ -164,7 +188,7 @@ def evaluate_model(model, loader, output_dir):
     # for key, val in overall_metrics.items():
     #     print(f"{key.capitalize()}: {val:.4f}")
 
-    return avg_metrics
+    return avg_overall_metrics
 
 # --- Main Evaluation ---
 def main():

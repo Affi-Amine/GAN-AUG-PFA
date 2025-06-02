@@ -14,6 +14,35 @@ def double_conv(in_channels, out_channels):
         nn.ReLU(inplace=True)
     )
 
+# --- Attention Gate --- 
+class AttentionGate(nn.Module):
+    def __init__(self, F_g, F_l, F_int):
+        super(AttentionGate, self).__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+        
+        self.W_x = nn.Sequential(
+            nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid()
+        )
+        
+        self.relu = nn.ReLU(inplace=True)
+        
+    def forward(self, g, x):
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        psi = self.relu(g1 + x1)
+        psi = self.psi(psi)
+        return x * psi
+
 # --- Siamese U-Net Architecture ---
 class SiameseUNet(nn.Module):
     def __init__(self, n_channels, n_classes):
@@ -33,11 +62,29 @@ class SiameseUNet(nn.Module):
 
         # Decoder Path
         self.upsample = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
-        # Combining features using absolute difference for skip connections
-        self.dconv_up3 = double_conv(1024 + 512, 512) # Input: Upsampled(Bottleneck) + Skip4_diff
-        self.dconv_up2 = double_conv(512 + 256, 256)  # Input: Upsampled(Dec4) + Skip3_diff
-        self.dconv_up1 = double_conv(256 + 128, 128)  # Input: Upsampled(Dec3) + Skip2_diff
-        self.dconv_last = double_conv(128 + 64, 64)     # Input: Upsampled(Dec2) + Skip1_diff
+
+        # Combined bottleneck and skip connection channel sizes (after concatenation of two branches)
+        ch_bottleneck_combined = 1024 * 2 # 2048
+        ch_skip4_combined = 512 * 2    # 1024
+        ch_skip3_combined = 256 * 2    # 512
+        ch_skip2_combined = 128 * 2    # 256
+        ch_skip1_combined = 64 * 2     # 128
+
+        # Attention Gates
+        # F_g is the number of channels in the gating signal (from the coarser resolution)
+        # F_l is the number of channels in the skip connection signal (from the encoder)
+        self.att3 = AttentionGate(F_g=ch_bottleneck_combined, F_l=ch_skip4_combined, F_int=ch_skip4_combined // 2) # g comes from upsampled bottleneck_combined
+        self.att2 = AttentionGate(F_g=512, F_l=ch_skip3_combined, F_int=ch_skip3_combined // 2)  # g comes from upsampled output of dconv_up3 (512 channels)
+        self.att1 = AttentionGate(F_g=256, F_l=ch_skip2_combined, F_int=ch_skip2_combined // 2)  # g comes from upsampled output of dconv_up2 (256 channels)
+        self.att_last = AttentionGate(F_g=128, F_l=ch_skip1_combined, F_int=ch_skip1_combined // 2) # g comes from upsampled output of dconv_up1 (128 channels)
+
+        # Decoder convolutions
+        # Input to dconv_up3: upsampled_bottleneck (ch_bottleneck_combined / 2 if upsampled from one, or ch_bottleneck_combined if upsampled from combined) + attended_skip4 (ch_skip4_combined)
+        # Assuming bottleneck_combined (2048) is upsampled, then its channels are 2048. Attended_skip4 is 1024.
+        self.dconv_up3 = double_conv(ch_bottleneck_combined + ch_skip4_combined, 512) # Upsampled(bottleneck_combined) + Attended(Skip4_combined)
+        self.dconv_up2 = double_conv(512 + ch_skip3_combined, 256)  # Upsampled(Dec_up3_out) + Attended(Skip3_combined)
+        self.dconv_up1 = double_conv(256 + ch_skip2_combined, 128)  # Upsampled(Dec_up2_out) + Attended(Skip2_combined)
+        self.dconv_last = double_conv(128 + ch_skip1_combined, 64)   # Upsampled(Dec_up1_out) + Attended(Skip1_combined)
 
         # Final Layer
         self.conv_last = nn.Conv2d(64, n_classes, 1)
@@ -60,28 +107,33 @@ class SiameseUNet(nn.Module):
         conv1_2, conv2_2, conv3_2, conv4_2, bottleneck2 = self.forward_encoder(x2)
 
         # --- Combine features and Decode ---
-        # Upsample bottleneck features (use bottleneck1, could also average or diff)
-        up_bottleneck = self.upsample(bottleneck1)
+        # Combine bottleneck features by concatenation
+        bottleneck_combined = torch.cat([bottleneck1, bottleneck2], dim=1)
+        up_bottleneck = self.upsample(bottleneck_combined) # Upsampled combined bottleneck
 
-        # Combine skip connection features (absolute difference)
-        skip4_diff = torch.abs(conv4_1 - conv4_2)
-        x = torch.cat([up_bottleneck, skip4_diff], dim=1)
-        x = self.dconv_up3(x)
-        x = self.upsample(x)
+        # Combine skip connection features (concatenation) and apply attention
+        skip4_combined = torch.cat([conv4_1, conv4_2], dim=1)
+        att_skip4 = self.att3(g=up_bottleneck, x=skip4_combined) # g is from lower layer (upsampled), x is from encoder
+        x = torch.cat([up_bottleneck, att_skip4], dim=1)
+        x = self.dconv_up3(x) # Output channels: 512
+        
+        up_x_for_att2 = self.upsample(x) # Upsampled output of dconv_up3 (512 channels)
+        skip3_combined = torch.cat([conv3_1, conv3_2], dim=1)
+        att_skip3 = self.att2(g=up_x_for_att2, x=skip3_combined)
+        x = torch.cat([up_x_for_att2, att_skip3], dim=1)
+        x = self.dconv_up2(x) # Output channels: 256
 
-        skip3_diff = torch.abs(conv3_1 - conv3_2)
-        x = torch.cat([x, skip3_diff], dim=1)
-        x = self.dconv_up2(x)
-        x = self.upsample(x)
+        up_x_for_att1 = self.upsample(x) # Upsampled output of dconv_up2 (256 channels)
+        skip2_combined = torch.cat([conv2_1, conv2_2], dim=1)
+        att_skip2 = self.att1(g=up_x_for_att1, x=skip2_combined)
+        x = torch.cat([up_x_for_att1, att_skip2], dim=1)
+        x = self.dconv_up1(x) # Output channels: 128
 
-        skip2_diff = torch.abs(conv2_1 - conv2_2)
-        x = torch.cat([x, skip2_diff], dim=1)
-        x = self.dconv_up1(x)
-        x = self.upsample(x)
-
-        skip1_diff = torch.abs(conv1_1 - conv1_2)
-        x = torch.cat([x, skip1_diff], dim=1)
-        x = self.dconv_last(x)
+        up_x_for_att_last = self.upsample(x) # Upsampled output of dconv_up1 (128 channels)
+        skip1_combined = torch.cat([conv1_1, conv1_2], dim=1)
+        att_skip1 = self.att_last(g=up_x_for_att_last, x=skip1_combined)
+        x = torch.cat([up_x_for_att_last, att_skip1], dim=1)
+        x = self.dconv_last(x) # Output channels: 64
 
         # Final output
         out = self.conv_last(x)

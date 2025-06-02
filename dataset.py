@@ -78,15 +78,59 @@ class JointRandomRotation:
             sample["label"] = transformed_label_1hw.squeeze(0)  # Shape: [H, W], dtype: torch.long
         return sample
 
-class JointColorJitter:
-    def __init__(self, brightness=0.2, contrast=0.2, saturation=0.2):
-        self.transform = transforms.ColorJitter(brightness, contrast, saturation)
+class JointRandomAffine:
+    def __init__(self, degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1), shear=10):
+        self.degrees = degrees
+        self.translate = translate
+        self.scale = scale
+        self.shear = shear
+
     def __call__(self, sample):
-        seed = random.randint(0, 2**32)
-        torch.manual_seed(seed)
-        sample["image1"] = self.transform(sample["image1"])
-        torch.manual_seed(seed)
-        sample["image2"] = self.transform(sample["image2"])
+        affine_params = transforms.RandomAffine.get_params(
+            degrees=(-self.degrees, self.degrees),
+            translate=self.translate,
+            scale_ranges=self.scale,
+            shears=(-self.shear, self.shear),
+            img_size=sample["image1"].size # PIL image size
+        )
+        sample["image1"] = TF.affine(sample["image1"], *affine_params, interpolation=TF.InterpolationMode.BILINEAR)
+        sample["image2"] = TF.affine(sample["image2"], *affine_params, interpolation=TF.InterpolationMode.BILINEAR)
+        if sample["label"] is not None:
+            # Label is PIL Image here before ToTensor
+            sample["label"] = TF.affine(sample["label"], *affine_params, interpolation=TF.InterpolationMode.NEAREST)
+        return sample
+
+class JointGaussianBlur:
+    def __init__(self, kernel_size=3, sigma=(0.1, 2.0)):
+        self.kernel_size = kernel_size
+        self.sigma = sigma
+
+    def __call__(self, sample):
+        # Apply GaussianBlur only to images, not labels
+        # Randomly select sigma for each image independently but same kernel size
+        sigma1 = random.uniform(self.sigma[0], self.sigma[1])
+        sample["image1"] = TF.gaussian_blur(sample["image1"], kernel_size=self.kernel_size, sigma=sigma1)
+        sigma2 = random.uniform(self.sigma[0], self.sigma[1])
+        sample["image2"] = TF.gaussian_blur(sample["image2"], kernel_size=self.kernel_size, sigma=sigma2)
+        return sample
+
+class JointColorJitter:
+    def __init__(self, brightness=0.2, contrast=0.2, saturation=0.2, hue=0):
+        # Store parameters, ColorJitter will be created per call for PIL images
+        self.brightness = brightness
+        self.contrast = contrast
+        self.saturation = saturation
+        self.hue = hue # Add hue if desired, though often not used for satellite
+
+    def __call__(self, sample):
+        # Create a new ColorJitter transform instance for each call to ensure different jittering
+        # for img1 and img2 if that's the desired behavior, or use the same instance if they should be jittered identically.
+        # For independent jittering (more common for data augmentation):
+        transform1 = transforms.ColorJitter(brightness=self.brightness, contrast=self.contrast, saturation=self.saturation, hue=self.hue)
+        transform2 = transforms.ColorJitter(brightness=self.brightness, contrast=self.contrast, saturation=self.saturation, hue=self.hue)
+        
+        sample["image1"] = transform1(sample["image1"]) # Applied to PIL image
+        sample["image2"] = transform2(sample["image2"]) # Applied to PIL image
         return sample
 
 class JointResize:
@@ -120,18 +164,32 @@ class BaseChangeDetectionDataset(Dataset):
         self.samples = samples_list
         self.target_size = target_size
         self.augment = augment
-        transform_list = [
-            JointToTensor(),
-            JointResize(self.target_size)
-        ]
+        # Note: Affine and GaussianBlur expect PIL images if placed before ToTensor
+        # ToTensor converts PIL to Tensor. Resize also happens after ToTensor in current setup.
+        # For Affine to work on PIL before ToTensor, it needs to be placed earlier.
+        # Let's adjust the order: Augmentations on PIL, then ToTensor, then Resize, then Normalize.
+
+        pil_augment_list = []
         if self.augment:
-            transform_list.extend([
+            pil_augment_list.extend([
+                JointRandomAffine(degrees=15, translate=(0.05, 0.05), scale=(0.95, 1.05), shear=5),
+                JointColorJitter(brightness=0.3, contrast=0.3, saturation=0.3), # Now applied to PIL
+                JointGaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
+            ])
+
+        tensor_augment_list = []
+        if self.augment:
+            tensor_augment_list.extend([
                 JointRandomHorizontalFlip(p=0.5),
                 JointRandomVerticalFlip(p=0.5),
                 JointRandomRotation(degrees=30),
-                JointColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
             ])
-        transform_list.append(JointNormalize())
+
+        transform_list = pil_augment_list + \
+                         [JointToTensor()] + \
+                         tensor_augment_list + \
+                         [JointResize(self.target_size), JointNormalize()]
+
         self.transform = transforms.Compose(transform_list)
 
     def _load_pil_image(self, file_path):
@@ -237,7 +295,7 @@ def _check_image_readable(file_path):
         return False
 
 # --- Function to Create Combined Dataset ---
-def create_change_detection_dataset(root_dir, dataset_subdir="Onera Satellite Change Detection Dataset", synthetic_data_dir="synthetic_data", mode="train", target_size=(128, 128), use_synthetic=False):
+def create_change_detection_dataset(root_dir, dataset_subdir="Onera Satellite Change Detection Dataset", synthetic_data_dir="synthetic_data", mode="train", target_size=(128, 128), use_synthetic=False, augment=False):
     ALL_CITIES = ["abudhabi", "aguasclaras", "beihai", "beirut", "bercy", "bordeaux", "cupertino", "hongkong", "mumbai", "nantes", "paris", "pisa", "rennes", "saclay_e"]
     VAL_CITIES = ["pisa", "rennes", "saclay_e"]
     TRAIN_CITIES = [city for city in ALL_CITIES if city not in VAL_CITIES]
@@ -250,18 +308,15 @@ def create_change_detection_dataset(root_dir, dataset_subdir="Onera Satellite Ch
     if mode == "train":
         target_cities = TRAIN_CITIES
         has_labels = True
-        augment = True
     elif mode == "val":
         target_cities = VAL_CITIES
         has_labels = True
-        augment = False
     elif mode == "test":
         try:
             target_cities = [d for d in os.listdir(real_image_base) if os.path.isdir(os.path.join(real_image_base, d))]
         except FileNotFoundError:
             target_cities = []
         has_labels = False
-        augment = False
     else:
         raise ValueError(f"Invalid mode: {mode}")
     print(f"--- Scanning Real Data ({mode}) ---")
